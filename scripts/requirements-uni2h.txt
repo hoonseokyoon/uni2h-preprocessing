@@ -1,0 +1,9 @@
+h5py
+huggingface_hub
+numpy
+openslide-python
+Pillow
+PyYAML
+timm
+torch
+tqdm
