@@ -183,7 +183,7 @@ def build_tissue_mask(slide, cfg: Dict[str, Any]):
 def integral_image(mask):
     import numpy as np
 
-    return np.pad(mask.astype(np.uint32), ((1, 0), (1, 0))).cumsum(0).cumsum(1)
+    return np.pad(mask.astype(np.int64), ((1, 0), (1, 0))).cumsum(0).cumsum(1)
 
 
 def rect_sum(ii, x0: int, y0: int, x1: int, y1: int) -> int:
