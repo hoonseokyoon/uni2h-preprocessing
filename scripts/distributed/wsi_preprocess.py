@@ -79,6 +79,8 @@ def planned_artifact_paths(payload: dict[str, Any], workspace_root: str | Path) 
         "thumbnail_jpg": slide_dir / "thumbnail.jpg",
         "tissue_mask_png": slide_dir / "tissue_mask.png",
         "qc_preview_jpg": slide_dir / "qc_preview.jpg",
+        "extract_stdout_log": slide_dir / "extract_stdout.log",
+        "extract_stderr_log": slide_dir / "extract_stderr.log",
         "manifest_json": slide_dir / "manifest.json",
     }
 
@@ -243,17 +245,21 @@ def execute_staged_wsi_task(
     thumbnail_published = publish_optional_artifact(local_thumbnail, paths["thumbnail_jpg"], job_id)
     tissue_mask_published = publish_optional_artifact(local_tissue_mask, paths["tissue_mask_png"], job_id)
     qc_preview_published = publish_optional_artifact(local_qc_preview, paths["qc_preview_jpg"], job_id)
+    stdout_log_published = publish_log_artifact(local_stdout_log := stdout_log, paths["extract_stdout_log"], job_id)
+    stderr_log_published = publish_log_artifact(local_stderr_log := stderr_log, paths["extract_stderr_log"], job_id)
 
     manifest = build_manifest(
         payload,
         staged,
         paths,
-        stdout_log,
-        stderr_log,
+        local_stdout_log,
+        local_stderr_log,
         overlay_published,
         thumbnail_published,
         tissue_mask_published,
         qc_preview_published,
+        stdout_log_published,
+        stderr_log_published,
     )
     write_json_atomically(paths["manifest_json"], manifest, job_id=job_id)
     progress(TASK_TOTAL_UNITS, TASK_TOTAL_UNITS, "wsi_uni2h complete")
@@ -271,6 +277,8 @@ def execute_staged_wsi_task(
             "thumbnail_path": str(paths["thumbnail_jpg"]) if thumbnail_published else None,
             "tissue_mask_path": str(paths["tissue_mask_png"]) if tissue_mask_published else None,
             "qc_preview_path": str(paths["qc_preview_jpg"]) if qc_preview_published else None,
+            "extract_stdout_log": str(paths["extract_stdout_log"]) if stdout_log_published else None,
+            "extract_stderr_log": str(paths["extract_stderr_log"]) if stderr_log_published else None,
             "slide_dir": str(paths["slide_dir"]),
             "staged_bytes": staged.bytes,
         },
@@ -424,11 +432,23 @@ def file_md5(path: Path) -> str:
 
 def copy_atomically(source: Path, final_path: Path, *, job_id: str) -> None:
     validate_nonempty(source, f"source artifact {source}")
+    copy_file_atomically(source, final_path, job_id=job_id, allow_empty=False)
+
+
+def copy_file_atomically(source: Path, final_path: Path, *, job_id: str, allow_empty: bool = False) -> None:
+    if not source.exists():
+        raise FileNotFoundError(f"source artifact does not exist: {source}")
+    if not allow_empty and source.stat().st_size <= 0:
+        raise RuntimeError(f"source artifact is empty: {source}")
     final_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = final_path.with_name(final_path.name + f".tmp.{safe_path_part(job_id)}.{os.getpid()}")
     try:
         shutil.copyfile(source, tmp)
-        validate_nonempty(tmp, f"temp artifact {tmp}")
+        if allow_empty:
+            if not tmp.exists():
+                raise FileNotFoundError(f"temp artifact {tmp} does not exist")
+        else:
+            validate_nonempty(tmp, f"temp artifact {tmp}")
         os.replace(tmp, final_path)
     finally:
         if tmp.exists():
@@ -439,6 +459,13 @@ def publish_optional_artifact(source: Path, final_path: Path, job_id: str) -> bo
     if not source.exists() or source.stat().st_size <= 0:
         return False
     copy_atomically(source, final_path, job_id=job_id)
+    return True
+
+
+def publish_log_artifact(source: Path, final_path: Path, job_id: str) -> bool:
+    if not source.exists():
+        return False
+    copy_file_atomically(source, final_path, job_id=job_id, allow_empty=True)
     return True
 
 
@@ -480,12 +507,16 @@ def build_manifest(
     thumbnail_published: bool,
     tissue_mask_published: bool,
     qc_preview_published: bool,
+    stdout_log_published: bool,
+    stderr_log_published: bool,
 ) -> dict[str, Any]:
     features = paths["features_h5"]
     overlay = paths["overlay_png"]
     thumbnail = paths["thumbnail_jpg"]
     tissue_mask = paths["tissue_mask_png"]
     qc_preview = paths["qc_preview_jpg"]
+    stdout_artifact = paths["extract_stdout_log"]
+    stderr_artifact = paths["extract_stderr_log"]
     return {
         "manifest_version": "wsi_uni2h_artifact_manifest_v0",
         "created_at": utc_now(),
@@ -509,6 +540,10 @@ def build_manifest(
         "tissue_mask_size_bytes": tissue_mask.stat().st_size if tissue_mask_published and tissue_mask.exists() else None,
         "qc_preview_jpg": str(qc_preview) if qc_preview_published else "",
         "qc_preview_size_bytes": qc_preview.stat().st_size if qc_preview_published and qc_preview.exists() else None,
+        "extract_stdout_log": str(stdout_artifact) if stdout_log_published else "",
+        "extract_stdout_size_bytes": stdout_artifact.stat().st_size if stdout_log_published and stdout_artifact.exists() else None,
+        "extract_stderr_log": str(stderr_artifact) if stderr_log_published else "",
+        "extract_stderr_size_bytes": stderr_artifact.stat().st_size if stderr_log_published and stderr_artifact.exists() else None,
         "staged_source": staged.source,
         "staged_bytes": staged.bytes,
         "extract_stdout_tail": read_tail(stdout_log),

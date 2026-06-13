@@ -6,6 +6,8 @@ import argparse
 import json
 import os
 import sys
+import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -16,13 +18,14 @@ from scripts.distributed.config import load_config
 from scripts.distributed.cost import CostManager
 from scripts.distributed.export_artifacts import ExportConfig, export_artifacts
 from scripts.distributed.models import JobState, PodRole, WorkerState
-from scripts.distributed.runpod_client import RunPodClient
+from scripts.distributed.runpod_client import RunPodClient, RunPodClientError
 from scripts.distributed.scheduler import Scheduler
 from scripts.distributed.server import create_app
 from scripts.distributed.store import DEFAULT_RUN_ID, SQLiteStore
 from scripts.distributed.worker import WorkerRunner
 from scripts.distributed.wsi_batch_worker import WSIBatchWorkerRunner
 from scripts.distributed.wsi_preprocess import planned_artifact_paths, safe_path_part
+from scripts.distributed.artifact_validation import validate_wsi_artifacts
 from scripts.downloader.download import DownloadConfig, load_plan_rows
 from scripts.downloader.planner import parse_datasets, parse_size
 
@@ -119,6 +122,33 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--plain", action="store_true", help="Force plain table output")
     p.set_defaults(handler=cmd_status)
 
+    p = sub.add_parser("events", help="Print durable job/worker events")
+    p.add_argument("--job-id")
+    p.add_argument("--worker-id")
+    p.add_argument("--event-type")
+    p.add_argument("--since-id", type=int)
+    p.add_argument("--limit", type=int, default=100)
+    p.add_argument("--newest-first", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(handler=cmd_events)
+
+    p = sub.add_parser("inspect-job", help="Print a job, latest progress, and recent events")
+    p.add_argument("job_id")
+    p.add_argument("--limit", type=int, default=100)
+    p.set_defaults(handler=cmd_inspect_job)
+
+    p = sub.add_parser("inspect-worker", help="Print a worker and recent events")
+    p.add_argument("worker_id")
+    p.add_argument("--limit", type=int, default=100)
+    p.set_defaults(handler=cmd_inspect_worker)
+
+    p = sub.add_parser("validate-artifacts", help="Validate WSI UNI2-h artifact directories")
+    p.add_argument("--artifact-root", required=True, type=Path)
+    p.add_argument("--simulate-ok", action="store_true")
+    p.add_argument("--limit", type=int)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(handler=cmd_validate_artifacts)
+
     p = sub.add_parser("set-cost-cap", help="Set or clear the hourly cost cap")
     p.add_argument("--cap", required=True, help="Hourly cap in dollars, or 'none'")
     mode = p.add_mutually_exclusive_group()
@@ -145,6 +175,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--execute", action="store_true", help="Call RunPod API; otherwise print planned actions")
     p.add_argument("--delete", action="store_true", help="Delete pods instead of stopping them")
     p.set_defaults(handler=cmd_terminate_drained_pods)
+
+    p = sub.add_parser("reconcile-pods", help="Refresh stored pod provider status from RunPod")
+    p.add_argument("--run-id", default=DEFAULT_RUN_ID)
+    p.add_argument("--include-stopped", action="store_true")
+    p.set_defaults(handler=cmd_reconcile_pods)
 
     p = sub.add_parser("export-artifacts", help="Export completed artifact trees to S3-compatible storage")
     p.add_argument("--artifact-root", required=True, type=Path)
@@ -178,6 +213,9 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--worker-token", default=os.environ.get("WORKER_TOKEN"))
         p.add_argument("--worker-role", default="wsi-preprocess")
         p.add_argument("--worker-id", help="Optional stable worker id to inject into the pod environment")
+        p.add_argument("--worker-env", action="append", default=[], help="Extra worker env as KEY=VALUE; can repeat")
+        p.add_argument("--docker-entrypoint-json", help="JSON list for RunPod dockerEntrypoint")
+        p.add_argument("--docker-start-cmd-json", help="JSON list for RunPod dockerStartCmd")
         p.set_defaults(handler=cmd_add_worker)
 
     p = sub.add_parser("drain-worker", help="Ask a worker to finish its current job and stop claiming")
@@ -337,6 +375,86 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_events(args: argparse.Namespace) -> int:
+    store = initialized_store(args.db)
+    events = store.list_events(
+        job_id=args.job_id,
+        worker_id=args.worker_id,
+        event_type=args.event_type,
+        since_id=args.since_id,
+        limit=args.limit,
+        newest_first=args.newest_first,
+    )
+    rows = [event_to_dict(event) for event in events]
+    if args.json:
+        print(json.dumps({"events": rows}, indent=2, ensure_ascii=False))
+        return 0
+    print("id\tcreated_at\tjob_id\tworker_id\tevent_type\tmessage")
+    for row in rows:
+        print(
+            f"{row['id']}\t{_fmt_ts(row['created_at'])}\t{row.get('job_id') or '-'}\t"
+            f"{row.get('worker_id') or '-'}\t{row.get('event_type') or '-'}\t{row.get('message') or '-'}"
+        )
+    return 0
+
+
+def cmd_inspect_job(args: argparse.Namespace) -> int:
+    store = initialized_store(args.db)
+    job = store.get_job(args.job_id)
+    latest = store.latest_progress_by_job([args.job_id]).get(args.job_id)
+    events = store.list_events(job_id=args.job_id, limit=args.limit)
+    print(
+        json.dumps(
+            {
+                "job": job_to_dict(job),
+                "latest_progress": event_to_dict(latest) if latest else None,
+                "events": [event_to_dict(event) for event in events],
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+def cmd_inspect_worker(args: argparse.Namespace) -> int:
+    store = initialized_store(args.db)
+    worker = store.get_worker(args.worker_id)
+    events = store.list_events(worker_id=args.worker_id, limit=args.limit)
+    print(
+        json.dumps(
+            {
+                "worker": worker_to_dict(worker),
+                "events": [event_to_dict(event) for event in events],
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+def cmd_validate_artifacts(args: argparse.Namespace) -> int:
+    report = validate_wsi_artifacts(args.artifact_root, simulate_ok=args.simulate_ok, limit=args.limit)
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        print(
+            f"artifact_root={report['artifact_root']} passed={report['passed']} "
+            f"slides={report['passed_slides']}/{report['slide_count']}"
+        )
+        for issue in report.get("issues") or []:
+            print(f"issue\t{issue}")
+        for slide in report["slides"]:
+            status = "pass" if slide["passed"] else "fail"
+            print(f"{status}\t{slide['slide_dir']}")
+            for issue in slide["issues"]:
+                print(f"  issue\t{issue}")
+            for warning in slide["warnings"]:
+                print(f"  warn\t{warning}")
+    return 0 if report["passed"] else 1
+
+
 def cmd_set_cost_cap(args: argparse.Namespace) -> int:
     store = initialized_store(args.db)
     cap = None if args.cap.lower() in {"none", "null", "off"} else float(args.cap)
@@ -415,6 +533,55 @@ def cmd_terminate_drained_pods(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reconcile_pods(args: argparse.Namespace) -> int:
+    store = initialized_store(args.db)
+    client = RunPodClient()
+    rows: list[dict[str, Any]] = []
+    status = 0
+    active_worker_ids = {worker.worker_id for worker in store.list_workers()}
+    for pod in store.list_pods():
+        if pod.run_id != args.run_id:
+            continue
+        if not args.include_stopped and pod.provider_status.lower() in {"stopped", "terminated", "deleted"}:
+            continue
+        item: dict[str, Any] = {
+            "pod_id": pod.pod_id,
+            "worker_id": pod.worker_id,
+            "old_provider_status": pod.provider_status,
+        }
+        try:
+            response = client.get_pod(pod.pod_id)
+            provider_status = extract_pod_status(response)
+            store.upsert_pod(
+                pod_id=pod.pod_id,
+                role=pod.role,
+                provider_status=provider_status,
+                run_id=pod.run_id,
+                worker_id=pod.worker_id,
+                gpu_type=pod.gpu_type,
+                cost_per_hr=pod.cost_per_hr,
+                adjusted_cost_per_hr=pod.adjusted_cost_per_hr,
+                start_time=pod.start_time,
+                stop_time=pod.stop_time,
+                data={**pod.data, "last_reconcile_response": response},
+            )
+            item["provider_status"] = provider_status
+            if pod.role == PodRole.WORKER and pod.worker_id and pod.worker_id not in active_worker_ids:
+                item["warning"] = "pod exists but worker has not registered"
+        except RunPodClientError as exc:
+            status = 1
+            item["error"] = str(exc)
+            store.add_event(
+                event_type="runpod_reconcile_failed",
+                message=str(exc),
+                data={"pod_id": pod.pod_id, "worker_id": pod.worker_id},
+                worker_id=pod.worker_id,
+            )
+        rows.append(item)
+    print(json.dumps({"run_id": args.run_id, "pods": rows}, indent=2, ensure_ascii=False))
+    return status
+
+
 def cmd_export_artifacts(args: argparse.Namespace) -> int:
     result = export_artifacts(
         ExportConfig(
@@ -425,7 +592,18 @@ def cmd_export_artifacts(args: argparse.Namespace) -> int:
             secret_access_key=args.secret_access_key,
             region_name=args.region_name,
             inventory_path=args.inventory_path,
-            include=tuple(args.include) if args.include else ("features.h5", "overlay.png", "thumbnail.jpg", "tissue_mask.png", "qc_preview.jpg", "manifest.json"),
+            include=tuple(args.include)
+            if args.include
+            else (
+                "features.h5",
+                "overlay.png",
+                "thumbnail.jpg",
+                "tissue_mask.png",
+                "qc_preview.jpg",
+                "extract_stdout.log",
+                "extract_stderr.log",
+                "manifest.json",
+            ),
             dry_run=bool(args.dry_run),
             skip_existing=not bool(args.overwrite),
         )
@@ -442,35 +620,79 @@ def cmd_add_worker(args: argparse.Namespace) -> int:
     if missing:
         raise SystemExit(f"missing required add-worker settings: {', '.join(missing)}")
     scheduler = Scheduler(store)
-    plan = scheduler.add_worker(
-        name=values["name"],
-        image_name=values["image_name"],
-        server_pod_id=values["server_pod_id"],
-        server_port=int(values["server_port"]),
-        run_id=values["run_id"],
-        workspace_root=values["workspace_root"],
-        gpu_type_ids=list(values["gpu_type_ids"]),
-        hourly_cost=float(values["hourly_cost"]),
-        worker_token=values.get("worker_token"),
-        worker_role=values["worker_role"],
-        gpu_count=int(values["gpu_count"]),
-        network_volume_id=values.get("network_volume_id"),
-        data_center_ids=values.get("data_center_ids"),
-        adjusted_hourly_cost=values.get("adjusted_hourly_cost"),
-        worker_id=values.get("worker_id"),
-        dry_run=not args.execute,
-    )
+    try:
+        plan = scheduler.add_worker(
+            name=values["name"],
+            image_name=values["image_name"],
+            server_pod_id=values["server_pod_id"],
+            server_port=int(values["server_port"]),
+            run_id=values["run_id"],
+            workspace_root=values["workspace_root"],
+            gpu_type_ids=list(values["gpu_type_ids"]),
+            hourly_cost=float(values["hourly_cost"]),
+            worker_token=values.get("worker_token"),
+            worker_role=values["worker_role"],
+            gpu_count=int(values["gpu_count"]),
+            network_volume_id=values.get("network_volume_id"),
+            data_center_ids=values.get("data_center_ids"),
+            adjusted_hourly_cost=values.get("adjusted_hourly_cost"),
+            env=values.get("env"),
+            docker_entrypoint=_json_string_list(values.get("docker_entrypoint_json"), "docker-entrypoint-json"),
+            docker_start_cmd=_json_string_list(values.get("docker_start_cmd_json"), "docker-start-cmd-json"),
+            worker_id=values.get("worker_id"),
+            dry_run=not args.execute,
+        )
+    except RunPodClientError as exc:
+        store.add_event(
+            event_type="runpod_add_worker_failed",
+            message=str(exc),
+            data={
+                "name": values["name"],
+                "gpu_type_ids": list(values["gpu_type_ids"]),
+                "run_id": values["run_id"],
+            },
+            worker_id=values.get("worker_id"),
+        )
+        print(json.dumps({"created": False, "error": str(exc)}, indent=2, ensure_ascii=False))
+        return 1
     if not plan.allowed:
         print(f"blocked: {plan.reason}")
         print(json.dumps(plan.payload, indent=2, sort_keys=True))
         return 1
     if plan.dry_run:
         print("dry-run worker payload:")
-        print(json.dumps(plan.payload, indent=2, sort_keys=True))
+        print(json.dumps(redact_secrets(plan.payload), indent=2, sort_keys=True))
     else:
         print("created worker pod:")
-        print(json.dumps(plan.pod_response, indent=2, sort_keys=True))
+        print(json.dumps(redact_secrets(plan.pod_response), indent=2, sort_keys=True))
     return 0
+
+
+def redact_secrets(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            key_text = str(key).upper()
+            if any(marker in key_text for marker in ("TOKEN", "SECRET", "PASSWORD", "ACCESS_KEY", "API_KEY")):
+                redacted[key] = "***"
+            else:
+                redacted[key] = redact_secrets(item)
+        return redacted
+    if isinstance(value, list):
+        return [redact_secrets(item) for item in value]
+    return value
+
+
+def _json_string_list(value: str | None, label: str) -> list[str] | None:
+    if not value:
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"{label} must be a JSON string list: {exc}") from exc
+    if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+        raise SystemExit(f"{label} must be a JSON string list")
+    return parsed
 
 
 def cmd_drain_worker(args: argparse.Namespace) -> int:
@@ -493,16 +715,25 @@ def render_status(store: SQLiteStore, *, force_plain: bool = False) -> None:
     counts = store.job_state_counts()
     progress = store.progress_snapshot()
     cost = CostManager(store).summarize()
+    watched_jobs = [job for job in jobs if job.state in {JobState.RUNNING, JobState.RETRYABLE, JobState.FAILED}]
+    latest_progress = store.latest_progress_by_job([job.id for job in watched_jobs])
     if not force_plain:
         try:
-            _render_status_rich(jobs, workers, counts, progress, cost)
+            _render_status_rich(jobs, workers, counts, progress, cost, latest_progress)
             return
         except ImportError:
             pass
-    _render_status_plain(jobs, workers, counts, progress, cost)
+    _render_status_plain(jobs, workers, counts, progress, cost, latest_progress)
 
 
-def _render_status_rich(jobs: list[Any], workers: list[Any], counts: dict[str, int], progress: Any, cost: Any) -> None:
+def _render_status_rich(
+    jobs: list[Any],
+    workers: list[Any],
+    counts: dict[str, int],
+    progress: Any,
+    cost: Any,
+    latest_progress: dict[str, Any],
+) -> None:
     from rich.console import Console
     from rich.progress import BarColumn, Progress, TextColumn
     from rich.table import Table
@@ -531,6 +762,29 @@ def _render_status_rich(jobs: list[Any], workers: list[Any], counts: dict[str, i
             _fmt_ts(worker.last_heartbeat_at),
         )
     console.print(worker_table)
+    watched_jobs = [job for job in jobs if job.state in {JobState.RUNNING, JobState.RETRYABLE, JobState.FAILED}]
+    if watched_jobs:
+        job_table = Table(title="Active / Problem Jobs")
+        job_table.add_column("Job")
+        job_table.add_column("State")
+        job_table.add_column("Worker")
+        job_table.add_column("Attempt")
+        job_table.add_column("Age")
+        job_table.add_column("Progress")
+        job_table.add_column("Latest Message")
+        for job in watched_jobs[:20]:
+            latest = latest_progress.get(job.id)
+            message = latest.message if latest and latest.message else job.error or "-"
+            job_table.add_row(
+                job.id,
+                job.state.value,
+                job.worker_id or "-",
+                f"{job.attempt}/{job.max_attempts}",
+                _fmt_age(job.started_at or job.created_at),
+                f"{job.completed_units:.1f}/{job.total_units:.1f}",
+                str(message)[:120],
+            )
+        console.print(job_table)
     console.print(
         f"burn=${cost.current_burn_rate_per_hr:.2f}/hr spent=${cost.spent_so_far:.2f} "
         f"eta={_fmt_duration(cost.eta_seconds)} est_remaining={_fmt_optional_money(cost.estimated_cost_to_completion)} "
@@ -538,7 +792,14 @@ def _render_status_rich(jobs: list[Any], workers: list[Any], counts: dict[str, i
     )
 
 
-def _render_status_plain(jobs: list[Any], workers: list[Any], counts: dict[str, int], progress: Any, cost: Any) -> None:
+def _render_status_plain(
+    jobs: list[Any],
+    workers: list[Any],
+    counts: dict[str, int],
+    progress: Any,
+    cost: Any,
+    latest_progress: dict[str, Any],
+) -> None:
     print("Distributed Execution Status")
     print("Jobs")
     print("state\tcount")
@@ -549,6 +810,18 @@ def _render_status_plain(jobs: list[Any], workers: list[Any], counts: dict[str, 
     print("worker_id\tstate\tcurrent_job\tlast_heartbeat")
     for worker in workers:
         print(f"{worker.worker_id}\t{worker.state.value}\t{worker.current_job_id or '-'}\t{_fmt_ts(worker.last_heartbeat_at)}")
+    watched_jobs = [job for job in jobs if job.state in {JobState.RUNNING, JobState.RETRYABLE, JobState.FAILED}]
+    if watched_jobs:
+        print("ActiveProblemJobs")
+        print("job_id\tstate\tworker_id\tattempt\tage\tprogress\tlatest_message")
+        for job in watched_jobs[:20]:
+            latest = latest_progress.get(job.id)
+            message = latest.message if latest and latest.message else job.error or "-"
+            print(
+                f"{job.id}\t{job.state.value}\t{job.worker_id or '-'}\t{job.attempt}/{job.max_attempts}\t"
+                f"{_fmt_age(job.started_at or job.created_at)}\t{job.completed_units:.1f}/{job.total_units:.1f}\t"
+                f"{str(message).replace(chr(9), ' ')[:200]}"
+            )
     print("Cost")
     print(f"burn_per_hr\t${cost.current_burn_rate_per_hr:.2f}")
     print(f"spent_so_far\t${cost.spent_so_far:.2f}")
@@ -635,10 +908,23 @@ def _worker_args_with_config(args: argparse.Namespace) -> dict[str, Any]:
         "worker_token": args.worker_token,
         "worker_role": args.worker_role,
         "worker_id": args.worker_id,
+        "docker_entrypoint_json": args.docker_entrypoint_json,
+        "docker_start_cmd_json": args.docker_start_cmd_json,
     }
     for key, value in cli_map.items():
         if value is not None:
             values[key] = value
+    extra_env = dict(values.get("env") or {})
+    for item in args.worker_env or []:
+        if "=" not in item:
+            raise SystemExit(f"--worker-env must be KEY=VALUE, got: {item}")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise SystemExit(f"--worker-env key cannot be empty: {item}")
+        extra_env[key] = value
+    if extra_env:
+        values["env"] = extra_env
     values.setdefault("gpu_count", 1)
     values.setdefault("worker_role", "wsi-preprocess")
     values.setdefault("workspace_root", "/workspace")
@@ -646,10 +932,46 @@ def _worker_args_with_config(args: argparse.Namespace) -> dict[str, Any]:
     return values
 
 
+def job_to_dict(job: Any) -> dict[str, Any]:
+    data = asdict(job)
+    data["state"] = job.state.value
+    return data
+
+
+def worker_to_dict(worker: Any) -> dict[str, Any]:
+    data = asdict(worker)
+    data["state"] = worker.state.value
+    return data
+
+
+def event_to_dict(event: Any) -> dict[str, Any]:
+    return asdict(event)
+
+
+def extract_pod_status(response: dict[str, Any]) -> str:
+    for key in ("status", "desiredStatus", "runtimeStatus", "containerStatus"):
+        value = response.get(key)
+        if value:
+            return str(value)
+    runtime = response.get("runtime")
+    if isinstance(runtime, dict):
+        for key in ("status", "uptimeInSeconds"):
+            value = runtime.get(key)
+            if value:
+                return str(value)
+    return "unknown"
+
+
 def _fmt_ts(value: float | None) -> str:
     if value is None:
         return "-"
     return f"{value:.0f}"
+
+
+def _fmt_age(started_at: float | None) -> str:
+    if started_at is None:
+        return "-"
+    return _fmt_duration(time.time() - float(started_at))
 
 
 def _fmt_duration(seconds: float | None) -> str:

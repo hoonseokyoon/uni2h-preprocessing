@@ -104,3 +104,14 @@ class CostSummary:
     hard_cap_enabled: bool
     scale_up_allowed: bool
     scale_up_block_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class JobEvent:
+    id: int
+    job_id: str | None
+    worker_id: str | None
+    event_type: str
+    message: str | None
+    created_at: float
+    data: dict[str, Any] = field(default_factory=dict)

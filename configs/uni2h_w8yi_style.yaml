@@ -1,0 +1,56 @@
+# W8Yi-style UNI2-h feature extraction defaults.
+# Mirrors the public specification in:
+# https://huggingface.co/datasets/W8Yi/tcga-wsi-uni2h-features
+
+model:
+  name: "hf-hub:MahmoodLab/UNI2-h"
+  create_model_kwargs:
+    pretrained: true
+    img_size: 224
+    patch_size: 14
+    depth: 24
+    num_heads: 24
+    init_values: 1.0e-5
+    embed_dim: 1536
+    mlp_ratio: 5.33334
+    num_classes: 0
+    no_embed_class: true
+    mlp_layer: "timm.layers.SwiGLUPacked"
+    act_layer: "torch.nn.SiLU"
+    reg_tokens: 8
+    dynamic_img_size: true
+  output_dim: 1536
+
+tiling:
+  tile_size_20x: 256
+  step_size_20x: 256
+  input_size: 224
+  objective_power_fallback: 20.0
+
+tissue_filter:
+  mask_max_dim: 2048
+  saturation_min: 20
+  value_max: 245
+  median_filter_size: 3
+  max_filter_size: 5
+  min_filter_size: 5
+  tissue_fraction_min: 0.15
+
+preprocess:
+  resize_resample: "bicubic"
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+
+runtime:
+  batch_size: 128
+  num_workers: 0
+  precision: "fp16"
+  device: "auto"
+
+output:
+  compression: null
+  write_overlay: true
+  write_thumbnail: true
+  write_tissue_mask: true
+  write_qc_preview: true
+  overlay_alpha: 48

@@ -1,0 +1,23 @@
+runpod:
+  server:
+    port: 8080
+    db_path: /workspace/server_state/runpod_distributed.sqlite
+    worker_token_env: WORKER_TOKEN
+  worker:
+    name: wsi-rna-worker
+    image_name: your-registry/path-rna-fusion-worker:latest
+    server_port: 8080
+    run_id: pilot-wsi-preprocess
+    workspace_root: /workspace
+    worker_role: wsi-preprocess
+    gpu_type_ids:
+      - NVIDIA RTX A4000
+    gpu_count: 1
+    network_volume_id: replace-with-runpod-network-volume-id
+    data_center_ids:
+      - US-KS-2
+    hourly_cost: 0.34
+    adjusted_hourly_cost: 0.34
+cost:
+  cap_per_hour: 2.0
+  hard_cap: false

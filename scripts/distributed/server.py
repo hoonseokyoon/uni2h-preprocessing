@@ -19,7 +19,7 @@ def create_app(store: SQLiteStore, *, worker_token: str, scheduler: Scheduler | 
     """
 
     try:
-        from fastapi import Depends, FastAPI, Header, HTTPException
+        from fastapi import Depends, FastAPI, Header, HTTPException, Query
     except ImportError as exc:
         raise RuntimeError("FastAPI is required for the HTTP server; install fastapi and uvicorn") from exc
 
@@ -148,6 +148,48 @@ def create_app(store: SQLiteStore, *, worker_token: str, scheduler: Scheduler | 
             "progress": asdict(store.progress_snapshot()),
         }
 
+    @app.get("/events", dependencies=[Depends(require_worker_token)])
+    def events(
+        job_id: str | None = None,
+        worker_id: str | None = None,
+        event_type: str | None = None,
+        since_id: int | None = None,
+        limit: int = Query(default=100, ge=1, le=1000),
+        newest_first: bool = False,
+    ) -> dict[str, Any]:
+        rows = store.list_events(
+            job_id=job_id,
+            worker_id=worker_id,
+            event_type=event_type,
+            since_id=since_id,
+            limit=limit,
+            newest_first=newest_first,
+        )
+        return {"events": [_event_dict(row) for row in rows]}
+
+    @app.get("/jobs/{job_id}", dependencies=[Depends(require_worker_token)])
+    def get_job(job_id: str) -> dict[str, Any]:
+        try:
+            job = store.get_job(job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        latest = store.latest_progress_by_job([job_id]).get(job_id)
+        events = store.list_events(job_id=job_id, limit=100)
+        return {
+            "job": _job_dict(job),
+            "latest_progress": _event_dict(latest) if latest else None,
+            "events": [_event_dict(row) for row in events],
+        }
+
+    @app.get("/workers/{worker_id}", dependencies=[Depends(require_worker_token)])
+    def get_worker(worker_id: str) -> dict[str, Any]:
+        try:
+            worker = store.get_worker(worker_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        events = store.list_events(worker_id=worker_id, limit=100)
+        return {"worker": _worker_dict(worker), "events": [_event_dict(row) for row in events]}
+
     @app.post("/config/cost-cap", dependencies=[Depends(require_worker_token)])
     def set_cost_cap(body: dict[str, Any]) -> dict[str, Any]:
         cap = body.get("cost_cap_per_hour", body.get("cap_per_hour"))
@@ -174,4 +216,9 @@ def _job_dict(job: Job | None) -> dict[str, Any] | None:
 def _worker_dict(worker: Worker) -> dict[str, Any]:
     data = asdict(worker)
     data["state"] = worker.state.value
+    return data
+
+
+def _event_dict(event: Any) -> dict[str, Any]:
+    data = asdict(event)
     return data

@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
-from .models import Job, JobState, PodRecord, PodRole, ProgressSnapshot, Worker, WorkerState
+from .models import Job, JobEvent, JobState, PodRecord, PodRole, ProgressSnapshot, Worker, WorkerState
 
 
 SCHEMA_VERSION = 1
@@ -132,6 +132,12 @@ class SQLiteStore:
                     created_at REAL NOT NULL,
                     data_json TEXT NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS idx_job_events_job
+                    ON job_events(job_id, id);
+                CREATE INDEX IF NOT EXISTS idx_job_events_worker
+                    ON job_events(worker_id, id);
+                CREATE INDEX IF NOT EXISTS idx_job_events_type
+                    ON job_events(event_type, id);
                 """
             )
             con.execute(
@@ -189,6 +195,20 @@ class SQLiteStore:
         if row is None:
             return default
         return _from_json(row["value_json"])
+
+    def add_event(
+        self,
+        *,
+        event_type: str,
+        message: str | None = None,
+        data: dict[str, Any] | None = None,
+        job_id: str | None = None,
+        worker_id: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        ts = now if now is not None else utc_now()
+        with self.connect() as con:
+            self._add_event(con, job_id, worker_id, event_type, message, data or {}, ts)
 
     def set_cost_cap(self, cap_per_hour: float | None, hard_cap: bool = False) -> None:
         self.set_config("cost", {"cap_per_hour": cap_per_hour, "hard_cap": bool(hard_cap)})
@@ -837,6 +857,60 @@ class SQLiteStore:
                 rows = con.execute("SELECT * FROM jobs ORDER BY created_at").fetchall()
         return [self._job_from_row(row) for row in rows]
 
+    def list_events(
+        self,
+        *,
+        job_id: str | None = None,
+        worker_id: str | None = None,
+        event_type: str | None = None,
+        since_id: int | None = None,
+        limit: int = 100,
+        newest_first: bool = False,
+    ) -> list[JobEvent]:
+        clauses: list[str] = []
+        values: list[Any] = []
+        if job_id:
+            clauses.append("job_id=?")
+            values.append(job_id)
+        if worker_id:
+            clauses.append("worker_id=?")
+            values.append(worker_id)
+        if event_type:
+            clauses.append("event_type=?")
+            values.append(event_type)
+        if since_id is not None:
+            clauses.append("id>?")
+            values.append(int(since_id))
+        query = "SELECT * FROM job_events"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY id DESC" if newest_first else " ORDER BY id ASC"
+        query += " LIMIT ?"
+        values.append(max(1, min(int(limit), 1000)))
+        with self.connect() as con:
+            rows = con.execute(query, values).fetchall()
+        return [self._event_from_row(row) for row in rows]
+
+    def latest_progress_by_job(self, job_ids: Sequence[str] | None = None) -> dict[str, JobEvent]:
+        values: list[Any] = ["progress"]
+        query = "SELECT * FROM job_events WHERE event_type=? AND job_id IS NOT NULL"
+        if job_ids is not None:
+            ids = [job_id for job_id in job_ids if job_id]
+            if not ids:
+                return {}
+            placeholders = ",".join("?" for _ in ids)
+            query += f" AND job_id IN ({placeholders})"
+            values.extend(ids)
+        query += " ORDER BY id ASC"
+        latest: dict[str, JobEvent] = {}
+        with self.connect() as con:
+            rows = con.execute(query, values).fetchall()
+        for row in rows:
+            event = self._event_from_row(row)
+            if event.job_id:
+                latest[event.job_id] = event
+        return latest
+
     def job_state_counts(self) -> dict[str, int]:
         with self.connect() as con:
             rows = con.execute("SELECT state, COUNT(*) AS n FROM jobs GROUP BY state").fetchall()
@@ -990,6 +1064,17 @@ class SQLiteStore:
             VALUES(?, ?, ?, ?, ?, ?)
             """,
             (job_id, worker_id, event_type, message, created_at, _to_json(data)),
+        )
+
+    def _event_from_row(self, row: sqlite3.Row) -> JobEvent:
+        return JobEvent(
+            id=int(row["id"]),
+            job_id=row["job_id"],
+            worker_id=row["worker_id"],
+            event_type=row["event_type"],
+            message=row["message"],
+            created_at=float(row["created_at"]),
+            data=_from_json(row["data_json"]),
         )
 
     def _job_from_row(self, row: sqlite3.Row) -> Job:

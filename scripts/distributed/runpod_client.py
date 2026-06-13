@@ -41,6 +41,8 @@ class WorkerPodSpec:
     global_networking: bool = True
     env: dict[str, str] | None = None
     docker_args: str | None = None
+    docker_entrypoint: list[str] | None = None
+    docker_start_cmd: list[str] | None = None
     ports: list[str] | None = None
 
 
@@ -100,6 +102,10 @@ class RunPodClient:
             payload["dataCenterIds"] = spec.data_center_ids
         if spec.docker_args:
             payload["dockerArgs"] = spec.docker_args
+        if spec.docker_entrypoint is not None:
+            payload["dockerEntrypoint"] = spec.docker_entrypoint
+        if spec.docker_start_cmd is not None:
+            payload["dockerStartCmd"] = spec.docker_start_cmd
         if spec.ports:
             payload["ports"] = spec.ports
         return payload

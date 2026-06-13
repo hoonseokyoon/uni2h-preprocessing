@@ -1,0 +1,32 @@
+ARG BASE_IMAGE=pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV APP_DIR=/opt/path-rna-fusion
+ENV PYTHONUNBUFFERED=1
+ENV HF_HOME=/workspace/.cache/huggingface
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    curl \
+    git \
+    libgl1 \
+    libglib2.0-0 \
+    libjpeg-turbo8 \
+    libopenjp2-7 \
+    libopenslide0 \
+    openslide-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR ${APP_DIR}
+COPY scripts/requirements-uni2h.txt scripts/requirements-uni2h.txt
+COPY scripts/requirements-runpod.txt scripts/requirements-runpod.txt
+RUN python -m pip install --upgrade pip \
+    && python -m pip install -r scripts/requirements-uni2h.txt \
+    && python -m pip install -r scripts/requirements-runpod.txt
+
+COPY . ${APP_DIR}
+RUN chmod +x ${APP_DIR}/scripts/runpod_entrypoint.sh
+
+ENTRYPOINT ["/opt/path-rna-fusion/scripts/runpod_entrypoint.sh"]

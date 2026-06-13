@@ -77,6 +77,8 @@ class Scheduler:
         adjusted_hourly_cost: float | None = None,
         dry_run: bool = True,
         env: dict[str, str] | None = None,
+        docker_entrypoint: list[str] | None = None,
+        docker_start_cmd: list[str] | None = None,
         worker_id: str | None = None,
         now: float | None = None,
     ) -> AddWorkerPlan:
@@ -99,6 +101,8 @@ class Scheduler:
             network_volume_id=network_volume_id,
             data_center_ids=data_center_ids,
             env=extra_env,
+            docker_entrypoint=docker_entrypoint,
+            docker_start_cmd=docker_start_cmd,
         )
         payload = RunPodClient.create_worker_payload(spec)
         projected_rate = adjusted_hourly_cost if adjusted_hourly_cost is not None else hourly_cost

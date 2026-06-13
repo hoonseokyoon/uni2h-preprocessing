@@ -31,6 +31,8 @@ DEFAULT_ARTIFACT_NAMES = (
     "thumbnail.jpg",
     "tissue_mask.png",
     "qc_preview.jpg",
+    "extract_stdout.log",
+    "extract_stderr.log",
     "manifest.json",
 )
 
